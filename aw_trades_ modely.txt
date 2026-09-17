@@ -1,0 +1,1077 @@
+//@version=6
+
+strategy("@aw_trades_ model aka JenNtonic/Herman Strategy", overlay=true, max_lines_count=300, max_labels_count=300, max_boxes_count=300, pyramiding=1, process_orders_on_close=true, default_qty_type=strategy.fixed, default_qty_value=1)
+
+// =============================================================================
+
+// AW MODEL - LIQUIDITY REVERSAL
+
+// Implements the six-step reversal sequence:
+
+//   1. Draw    -> nearest untaken swing liquidity (opposite side, used as target)
+
+//   2. Neckline-> last opposing swing before the sweep
+
+//   3. Sweep   -> wick through a swing high/low that closes back inside
+
+//   4. Shift   -> displacement candle closing back through the neckline
+
+//   5. Entry   -> retrace into the Fair Value Gap left by the displacement
+
+//   6. Target  -> nearest untaken liquidity on the opposite side (or fixed R)
+
+// Tracks both bullish and bearish reversals independently. Swing points confirm
+
+// with a lag of `Swing Length` bars (normal for structure-based tools) - this
+
+// is not a repainting signal generator, just a delayed structure confirmation.
+
+// Also tracks each triggered trade to its resolution (stop or target hit) and
+
+// keeps a running daily / cumulative P&L table.
+
+//
+
+// ---- CROSSTRADE SETUP (for the webhook alerts below) ----------------------
+
+// CrossTrade is the bridge that turns a TradingView alert into a real order in
+
+// NinjaTrader 8. Sign up here: https://crosstrade.io/pricing?ref=JNT
+
+//   1. Create a CrossTrade account at the link above and pick a plan.
+
+//   2. Inside CrossTrade, connect it to your NinjaTrader 8 install (it walks
+
+//      you through installing its NT8 add-on).
+
+//   3. In the CrossTrade dashboard, open your webhook/bridge settings and
+
+//      copy your SECRET KEY - this is the value that goes in WEBHOOK_KEY
+
+//      below, NOT your CrossTrade login password.
+
+//   4. Paste that key between the quotes on the WEBHOOK_KEY line further
+
+//      down in this script (search for "PASTE_YOUR_KEY_HERE"), directly in
+
+//      Pine Editor's code view, then save.
+
+//   5. In this indicator's Settings -> CrossTrade Webhook, fill in your NT8
+
+//      Account name exactly as it appears in the CrossTrade/NT8 add-on, and
+
+//      turn on "Send CrossTrade Webhook Alerts" when you're ready to go live.
+
+//   6. On the chart, create ONE TradingView alert on this indicator with
+
+//      condition "Any alert() function call", and paste the webhook URL
+
+//      CrossTrade gives you into the alert's Notifications -> Webhook URL
+
+//      field. That alert is what actually delivers every signal to CrossTrade.
+
+// =============================================================================
+
+// ---------------- Inputs ----------------
+
+grpSwing = "Swing / Structure"
+
+swingLen = input.int(3, "Swing Length", minval=2, group=grpSwing, tooltip="Bars on each side required to confirm a swing high/low")
+
+maxLiquidity = input.int(15, "Liquidity Levels Stored (per side)", minval=5, maxval=40, group=grpSwing)
+
+grpLiqSrc = "Additional Liquidity Sources"
+
+useHTFLiquidity = input.bool(true, "Include Higher-Timeframe Swing Liquidity", group=grpLiqSrc, tooltip="Pulls swing highs/lows from a higher timeframe as extra target candidates, folded into the same untaken-liquidity pool used for the chart's own swings")
+
+htfMode = input.string("Auto", "HTF Pairing", options=["Auto", "Manual"], group=grpLiqSrc, tooltip="Auto ladder: 1m->15m, 3m->30m, 5m->1H, 15m->4H, 30m->6H, 1H-3H->D, 4H+->W")
+
+htfManual = input.timeframe("60", "  - Manual HTF", group=grpLiqSrc)
+
+htfPivotStrength = input.int(2, "HTF Pivot Strength", minval=1, maxval=10, group=grpLiqSrc)
+
+usePDHL = input.bool(true, "Include Previous Day High/Low", group=grpLiqSrc)
+
+grpDisp = "Displacement / Structure Shift"
+
+atrLen = input.int(2, "ATR Length", group=grpDisp)
+
+dispMult = input.float(1.0, "Displacement Body >= ATR x", minval=0.1, step=0.1, group=grpDisp)
+
+maxBarsToMSS = input.int(30, "Max Bars: Sweep -> Shift", minval=3, group=grpDisp, tooltip="Invalidate the sweep if structure isn't broken within this many bars")
+
+grpFVG = "Fair Value Gap Entry"
+
+fvgSearchWindow = input.int(1, "FVG Search Window (bars after shift)", minval=0, maxval=5, group=grpFVG)
+
+maxBarsToEntry = input.int(10, "Max Bars: Shift -> Entry", minval=3, group=grpFVG, tooltip="Invalidate if price never retraces into the FVG within this many bars")
+
+// ---------------- Session filter (New York time) ----------------
+// These toggles filter ENTRY triggers only. The underlying AW setup logic,
+// invalidations, stop and target calculations remain unchanged.
+grpSessions = "Sessions (New York Time)"
+useAsia = input.bool(true, "Asia 20:00-02:00", group=grpSessions, tooltip="Allow entries from 20:00 to 02:00 New York time")
+useLondon = input.bool(true, "London 02:00-08:00", group=grpSessions, tooltip="Allow entries from 02:00 to 08:00 New York time")
+useNYAM = input.bool(true, "NY AM 08:00-12:00", group=grpSessions, tooltip="Allow entries from 08:00 to 12:00 New York time")
+useNYPM = input.bool(false, "NY PM 12:00-16:00", group=grpSessions, tooltip="Allow entries from 12:00 to 16:00 New York time")
+
+inAsia = not na(time(timeframe.period, "2000-0200:1234567", "America/New_York"))
+inLondon = not na(time(timeframe.period, "0200-0800:1234567", "America/New_York"))
+inNYAM = not na(time(timeframe.period, "0800-1200:1234567", "America/New_York"))
+inNYPM = not na(time(timeframe.period, "1200-1600:1234567", "America/New_York"))
+
+sessionAllowed = (useAsia and inAsia) or (useLondon and inLondon) or (useNYAM and inNYAM) or (useNYPM and inNYPM)
+
+grpTarget = "Target / Stop"
+
+targetMode = input.string("Opposite Liquidity", "Target Mode", options=["Opposite Liquidity", "Fixed R Multiple"], group=grpTarget)
+
+targetR = input.float(1.0, "Fixed R Multiple (fallback / if selected)", minval=0.5, step=0.5, group=grpTarget)
+
+projectBars = input.int(20, "Stop/Target Line Length While Open (bars)", minval=5, group=grpTarget)
+
+grpPnl = "P&L Table"
+
+showTable = input.bool(true, "Show P&L Table", group=grpPnl)
+
+pointValue = input.float(2.0, "Dollar Value per Point (e.g. NQ=20, MNQ=2)", minval=0.01, step=0.5, group=grpPnl)
+
+maxTableRows = input.int(20, "Days to Show in Table", minval=3, maxval=30, group=grpPnl)
+
+tablePos = input.string("top_right", "Table Position", options=["top_right", "top_left", "bottom_right", "bottom_left"], group=grpPnl)
+
+tableTheme = input.string("Light", "Table Color Theme", options=["Dark", "Light"], group=grpPnl, tooltip="Pick Light if your chart background is white/light so the table stays readable")
+
+grpWebhook = "CrossTrade Webhook"
+
+enableWebhook = input.bool(false, "Send CrossTrade Webhook Alerts", group=grpWebhook, tooltip="When on, entry triggers call alert() with a plain key=value CrossTrade payload (bracket TP/SL, no separate close commands)")
+
+accountInput = input.string("", "Account", group=grpWebhook)
+
+autoInstrument = input.bool(true, "Auto-Detect Instrument From Chart", group=grpWebhook, tooltip="Uses the exact contract you're currently charting (e.g. MNQU2026 -> MNQU6) so TradingView and NT8 always match. Only works if you're charting the actual dated contract, NOT the continuous MNQ1! chart - turn this off and type the ticker manually if you chart the continuous symbol.")
+
+manualInstrumentInput = input.string("", "Instrument (used only if Auto-Detect is off)", group=grpWebhook)
+
+qtyInput = input.int(1, "Quantity", minval=1, group=grpWebhook)
+
+// ============================================================================
+
+// >>> PASTE YOUR CROSSTRADE SECRET KEY BETWEEN THE QUOTES BELOW, THEN SAVE <<<
+
+// Don't have a CrossTrade account yet? Sign up here first:
+
+// https://crosstrade.io/pricing?ref=JNT
+
+// Your secret key is in the CrossTrade dashboard under your webhook/bridge
+
+// settings - NOT your login password. See the setup steps near the top of
+
+// this script for the full walkthrough.
+
+// A Settings-panel string input for the key gets wiped by a mobile UI glitch,
+
+// so the key lives here instead. Edit this ONE line directly in Pine Editor's
+
+// code view - it will NOT reset when you save, move the cursor, or reopen the
+
+// chart. If you ever paste a fresh full-script update in the future, remember
+
+// to copy your key back into this line before saving - a full-file paste will
+
+// overwrite it with the placeholder below.
+
+// ============================================================================
+
+var string WEBHOOK_KEY = "PASTE_YOUR_KEY_HERE"
+
+grpDisplay = "Display"
+
+showSweeps = input.bool(false, "Show Sweep / Shift Labels", group=grpDisplay)
+
+showNeckline = input.bool(true, "Show Neckline", group=grpDisplay)
+
+showFVG = input.bool(true, "Show FVG Box", group=grpDisplay)
+
+showTrade = input.bool(true, "Show Entry / Stop / Target", group=grpDisplay)
+
+bullColor = input.color(color.new(color.teal, 0), "Bullish Color", group=grpDisplay)
+
+bearColor = input.color(color.new(#e91e63, 0), "Bearish Color", group=grpDisplay)
+
+atrVal = ta.atr(atrLen)
+
+_tfs = timeframe.in_seconds()
+
+// ---------------- Helpers ----------------
+
+f_pad2(n) =>
+
+    n < 10 ? "0" + str.tostring(n) : str.tostring(n)
+
+f_dayKey() =>
+
+    str.tostring(year(time)) + "-" + f_pad2(month(time)) + "-" + f_pad2(dayofmonth(time))
+
+// Converts the chart's own contract symbol (e.g. MNQU2026) into NT8's expected
+
+// short form (e.g. MNQU6 - root + month code + last digit of year). Falls back
+
+// to the manual input if the ticker doesn't parse as expected (e.g. you're on
+
+// a continuous MNQ1! chart, where this auto-detection cannot help).
+
+f_autoInstrument() =>
+
+    string result = manualInstrumentInput
+
+    if str.length(syminfo.ticker) > str.length(syminfo.root)
+
+        suffix = str.substring(syminfo.ticker, str.length(syminfo.root))
+
+        if str.length(suffix) >= 2
+
+            monthCode = str.substring(suffix, 0, 1)
+
+            yearDigit = str.substring(suffix, str.length(suffix) - 1, str.length(suffix))
+
+            result := syminfo.root + monthCode + yearDigit
+
+    result
+
+instrumentInput = autoInstrument ? f_autoInstrument() : manualInstrumentInput
+
+// ---------------- Swing / Liquidity Tracking ----------------
+
+ph = ta.pivothigh(swingLen, swingLen)
+
+pl = ta.pivotlow(swingLen, swingLen)
+
+var float lastPivotHigh = na
+
+var int lastPivotHighBar = na
+
+var float lastPivotLow = na
+
+var int lastPivotLowBar = na
+
+var array<float> liqHighPrice = array.new<float>(0)
+
+var array<int>   liqHighBar   = array.new<int>(0)
+
+var array<bool>  liqHighTaken = array.new<bool>(0)
+
+var array<float> liqLowPrice  = array.new<float>(0)
+
+var array<int>   liqLowBar    = array.new<int>(0)
+
+var array<bool>  liqLowTaken  = array.new<bool>(0)
+
+if not na(ph)
+
+    lastPivotHigh := ph
+
+    lastPivotHighBar := bar_index - swingLen
+
+    array.push(liqHighPrice, ph)
+
+    array.push(liqHighBar, bar_index - swingLen)
+
+    array.push(liqHighTaken, false)
+
+    if array.size(liqHighPrice) > maxLiquidity
+
+        array.shift(liqHighPrice)
+
+        array.shift(liqHighBar)
+
+        array.shift(liqHighTaken)
+
+if not na(pl)
+
+    lastPivotLow := pl
+
+    lastPivotLowBar := bar_index - swingLen
+
+    array.push(liqLowPrice, pl)
+
+    array.push(liqLowBar, bar_index - swingLen)
+
+    array.push(liqLowTaken, false)
+
+    if array.size(liqLowPrice) > maxLiquidity
+
+        array.shift(liqLowPrice)
+
+        array.shift(liqLowBar)
+
+        array.shift(liqLowTaken)
+
+if array.size(liqHighPrice) > 0
+
+    for i = 0 to array.size(liqHighPrice) - 1
+
+        if not array.get(liqHighTaken, i) and high > array.get(liqHighPrice, i)
+
+            array.set(liqHighTaken, i, true)
+
+if array.size(liqLowPrice) > 0
+
+    for i = 0 to array.size(liqLowPrice) - 1
+
+        if not array.get(liqLowTaken, i) and low < array.get(liqLowPrice, i)
+
+            array.set(liqLowTaken, i, true)
+
+// ---------------- Additional liquidity sources (HTF swings + prev-day H/L) ----------------
+
+// Folded into the SAME liqHigh/liqLow arrays used above, so the existing
+
+// "mark taken" loops and nearest-untaken target selection automatically cover
+
+// these too - no separate tracking system needed.
+
+f_pushLiquidity(array<float> arrPrice, array<int> arrBar, array<bool> arrTaken, float px) =>
+
+    array.push(arrPrice, px)
+
+    array.push(arrBar, bar_index)
+
+    array.push(arrTaken, false)
+
+    if array.size(arrPrice) > maxLiquidity
+
+        array.shift(arrPrice)
+
+        array.shift(arrBar)
+
+        array.shift(arrTaken)
+
+    true
+
+htfAuto = _tfs <= 60 ? "15" : _tfs <= 180 ? "30" : _tfs <= 300 ? "60" : _tfs <= 900 ? "240" : _tfs <= 1800 ? "360" : _tfs <= 10800 ? "D" : _tfs <= 86400 ? "W" : "3M"
+
+htfTF = htfMode == "Manual" ? htfManual : htfAuto
+
+htfSec = timeframe.in_seconds(htfTF)
+
+htfOk = useHTFLiquidity and htfSec > _tfs
+
+// Non-repainting idiom: valuewhen + lookahead_off reports a higher-timeframe
+
+// pivot only once its own confirmation bar has actually closed on that frame.
+
+[hH, hHt, hL, hLt] = request.security(syminfo.tickerid, htfTF,
+
+     [ta.valuewhen(not na(ta.pivothigh(htfPivotStrength, htfPivotStrength)), ta.pivothigh(htfPivotStrength, htfPivotStrength), 0),
+
+      ta.valuewhen(not na(ta.pivothigh(htfPivotStrength, htfPivotStrength)), time[htfPivotStrength], 0),
+
+      ta.valuewhen(not na(ta.pivotlow(htfPivotStrength, htfPivotStrength)), ta.pivotlow(htfPivotStrength, htfPivotStrength), 0),
+
+      ta.valuewhen(not na(ta.pivotlow(htfPivotStrength, htfPivotStrength)), time[htfPivotStrength], 0)],
+
+     lookahead = barmerge.lookahead_off)
+
+if barstate.isconfirmed and htfOk
+
+    if not na(hH) and not na(hHt) and hHt != nz(hHt[1])
+
+        f_pushLiquidity(liqHighPrice, liqHighBar, liqHighTaken, hH)
+
+    if not na(hL) and not na(hLt) and hLt != nz(hLt[1])
+
+        f_pushLiquidity(liqLowPrice, liqLowBar, liqLowTaken, hL)
+
+// Previous completed day's high/low - a standard liquidity pool on its own,
+
+// confirmed data via lookahead_on since it only ever references a fully closed prior day.
+
+[pdh, pdl, pdt] = request.security(syminfo.tickerid, "D", [high[1], low[1], time[1]], lookahead = barmerge.lookahead_on)
+
+pdOk = usePDHL and _tfs <= 86400
+
+if barstate.isconfirmed and pdOk and not na(pdt)
+
+    if na(pdt[1]) or pdt != pdt[1]
+
+        f_pushLiquidity(liqHighPrice, liqHighBar, liqHighTaken, pdh)
+
+        f_pushLiquidity(liqLowPrice, liqLowBar, liqLowTaken, pdl)
+
+f_nearestUntakenAbove(price) =>
+
+    float result = na
+
+    if array.size(liqHighPrice) > 0
+
+        for i = 0 to array.size(liqHighPrice) - 1
+
+            p = array.get(liqHighPrice, i)
+
+            taken = array.get(liqHighTaken, i)
+
+            if not taken and p > price and (na(result) or p < result)
+
+                result := p
+
+    result
+
+f_nearestUntakenBelow(price) =>
+
+    float result = na
+
+    if array.size(liqLowPrice) > 0
+
+        for i = 0 to array.size(liqLowPrice) - 1
+
+            p = array.get(liqLowPrice, i)
+
+            taken = array.get(liqLowTaken, i)
+
+            if not taken and p < price and (na(result) or p > result)
+
+                result := p
+
+    result
+
+// ---------------- P&L tracking ----------------
+
+var map<string, float> dailyPnl = map.new<string, float>()
+
+var map<string, int> dailyWins = map.new<string, int>()
+
+var map<string, int> dailyLosses = map.new<string, int>()
+
+var array<string> dayOrder = array.new<string>(0)
+
+// cumTotal and win/loss counters are wrapped in arrays because a function
+
+// cannot reassign a plain global `var` primitive in Pine (CE10088) - mutating
+
+// array CONTENTS from inside a function is legal, so this is the standard
+
+// workaround. winLossArr: [0] = total wins, [1] = total losses.
+
+var array<float> cumTotalArr = array.new<float>(1, 0.0)
+
+var array<int> winLossArr = array.new<int>(2, 0)
+
+f_recordPnl(points) =>
+
+    dollars = points * pointValue
+
+    array.set(cumTotalArr, 0, array.get(cumTotalArr, 0) + dollars)
+
+    isWin = points > 0
+
+    wlIdx = isWin ? 0 : 1
+
+    array.set(winLossArr, wlIdx, array.get(winLossArr, wlIdx) + 1)
+
+    key = f_dayKey()
+
+    if map.contains(dailyPnl, key)
+
+        map.put(dailyPnl, key, map.get(dailyPnl, key) + dollars)
+
+        map.put(dailyWins, key, map.get(dailyWins, key) + (isWin ? 1 : 0))
+
+        map.put(dailyLosses, key, map.get(dailyLosses, key) + (isWin ? 0 : 1))
+
+    else
+
+        map.put(dailyPnl, key, dollars)
+
+        map.put(dailyWins, key, isWin ? 1 : 0)
+
+        map.put(dailyLosses, key, isWin ? 0 : 1)
+
+        array.push(dayOrder, key)
+
+    dollars
+
+// ---------------- Signal flags (reset each bar) ----------------
+
+bullEntrySignal = false
+
+bearEntrySignal = false
+
+// ---------------- Strategy Tester bridge ----------------
+// Signal logic, invalidations, stop and target calculations below are unchanged.
+// The original indicator records a theoretical fill at the already-known low/high
+// of the FVG-creation bar. TradingView's broker emulator cannot retroactively fill
+// a newly created order at an earlier intrabar extreme, so the Strategy Tester
+// mirrors the same signal on that bar's close (process_orders_on_close=true).
+// Opposite virtual trades can coexist in the original tracker; a TradingView
+// strategy cannot hedge one symbol, so the report only submits a new order while flat.
+reportOrderIssuedThisBar = false
+
+// ---------------- CrossTrade webhook (entry only - TP/SL ride the bracket) ----------------
+
+// flatten_first=true only on a session's first entry, never on scale-in adds.
+
+// lastEntryDayKey is reassigned in the main script scope (not inside a function),
+
+// so the CE10088 function-reassignment restriction does not apply to it.
+
+var string lastEntryDayKey = ""
+
+f_sendEntryWebhook(action, stopPrice, targetPrice, isFirstOfSession) =>
+
+    if enableWebhook
+
+        payload = "key=" + WEBHOOK_KEY + ";command=place;account=" + accountInput + ";instrument=" + instrumentInput + ";action=" + action + ";qty=" + str.tostring(qtyInput) + ";order_type=market;tif=day;take_profit=" + str.tostring(math.round_to_mintick(targetPrice)) + ";stop_loss=" + str.tostring(math.round_to_mintick(stopPrice)) + ";" + (isFirstOfSession ? "flatten_first=true;" : "")
+
+        alert(payload, alert.freq_once_per_bar_close)
+
+    true
+
+// ---------------- Live trade tracking (one long slot, one short slot) ----------------
+
+var bool liveLongOpen = false
+
+var float liveLongEntry = na
+
+var float liveLongStop = na
+
+var float liveLongTarget = na
+
+var line liveLongStopLine = na
+
+var line liveLongTargetLine = na
+
+var bool liveShortOpen = false
+
+var float liveShortEntry = na
+
+var float liveShortStop = na
+
+var float liveShortTarget = na
+
+var line liveShortStopLine = na
+
+var line liveShortTargetLine = na
+
+// Resolve open long trade: check stop before target on the same bar (conservative)
+
+if liveLongOpen
+
+    if low <= liveLongStop
+
+        pts = liveLongStop - liveLongEntry
+
+        f_recordPnl(pts)
+
+        if showTrade
+
+            label.new(bar_index, liveLongStop, "STOP\n" + str.tostring(math.round_to_mintick(pts)) + "pts", style=label.style_label_down, color=color.red, textcolor=color.white, size=size.small)
+
+            line.set_x2(liveLongStopLine, bar_index)
+
+            line.set_x2(liveLongTargetLine, bar_index)
+
+        liveLongOpen := false
+
+    else if high >= liveLongTarget
+
+        pts = liveLongTarget - liveLongEntry
+
+        f_recordPnl(pts)
+
+        if showTrade
+
+            label.new(bar_index, liveLongTarget, "EXIT +" + str.tostring(math.round_to_mintick(pts)) + "pts", style=label.style_label_down, color=color.green, textcolor=color.white, size=size.small)
+
+            line.set_x2(liveLongStopLine, bar_index)
+
+            line.set_x2(liveLongTargetLine, bar_index)
+
+        liveLongOpen := false
+
+// Resolve open short trade: check stop before target on the same bar (conservative)
+
+if liveShortOpen
+
+    if high >= liveShortStop
+
+        pts = liveShortEntry - liveShortStop
+
+        f_recordPnl(pts)
+
+        if showTrade
+
+            label.new(bar_index, liveShortStop, "STOP\n" + str.tostring(math.round_to_mintick(pts)) + "pts", style=label.style_label_up, color=color.red, textcolor=color.white, size=size.small)
+
+            line.set_x2(liveShortStopLine, bar_index)
+
+            line.set_x2(liveShortTargetLine, bar_index)
+
+        liveShortOpen := false
+
+    else if low <= liveShortTarget
+
+        pts = liveShortEntry - liveShortTarget
+
+        f_recordPnl(pts)
+
+        if showTrade
+
+            label.new(bar_index, liveShortTarget, "EXIT +" + str.tostring(math.round_to_mintick(pts)) + "pts", style=label.style_label_up, color=color.green, textcolor=color.white, size=size.small)
+
+            line.set_x2(liveShortStopLine, bar_index)
+
+            line.set_x2(liveShortTargetLine, bar_index)
+
+        liveShortOpen := false
+
+// ---------------- Bullish Reversal State Machine ----------------
+
+var bool bullActive = false
+
+var bool bullMSS = false
+
+var bool bullFVGSet = false
+
+var bool bullTriggered = false
+
+var float bullNeckline = na
+
+var int bullNecklineBar = na
+
+var float bullSweptLow = na
+
+var int bullSweepBar = na
+
+var int bullMSSBar = na
+
+var float bullFVGTop = na
+
+var float bullFVGBot = na
+
+var int bullFVGBar = na
+
+var line bullNecklineLine = na
+
+var box bullFVGBox = na
+
+sweepLowCond = not bullActive and not na(lastPivotLow) and low < lastPivotLow and close > lastPivotLow and bar_index > lastPivotLowBar
+
+if sweepLowCond
+
+    bullActive := true
+
+    bullMSS := false
+
+    bullFVGSet := false
+
+    bullTriggered := false
+
+    bullSweptLow := low
+
+    bullSweepBar := bar_index
+
+    bullNeckline := lastPivotHigh
+
+    bullNecklineBar := lastPivotHighBar
+
+    if showSweeps
+
+        label.new(bar_index, low, "SWEEP", style=label.style_label_up, color=bullColor, textcolor=color.white, size=size.tiny)
+
+    if showNeckline and not na(bullNeckline)
+
+        bullNecklineLine := line.new(bullNecklineBar, bullNeckline, bar_index + maxBarsToMSS, bullNeckline, color=bullColor, style=line.style_dashed)
+
+if bullActive and not bullMSS
+
+    if bar_index - bullSweepBar > maxBarsToMSS
+
+        bullActive := false
+
+    else if not na(bullNeckline) and close > bullNeckline and (close - open) >= atrVal * dispMult and close > open
+
+        bullMSS := true
+
+        bullMSSBar := bar_index
+
+        if showNeckline and not na(bullNecklineLine)
+
+            line.set_x2(bullNecklineLine, bar_index)
+
+        if showSweeps
+
+            label.new(bar_index, high, "SHIFT", style=label.style_label_down, color=bullColor, textcolor=color.white, size=size.tiny)
+
+if bullActive and bullMSS and not bullFVGSet
+
+    if bar_index - bullMSSBar > fvgSearchWindow + 2
+
+        bullActive := false
+
+    else if low > high[2]
+
+        bullFVGSet := true
+
+        bullFVGTop := low
+
+        bullFVGBot := high[2]
+
+        bullFVGBar := bar_index
+
+        if showFVG
+
+            bullFVGBox := box.new(bar_index[2], bullFVGBot, bar_index + maxBarsToEntry, bullFVGTop, border_color=bullColor, bgcolor=color.new(bullColor, 85))
+
+if bullActive and bullFVGSet and not bullTriggered
+
+    if bar_index - bullFVGBar > maxBarsToEntry
+
+        bullActive := false
+
+    else if close < bullSweptLow
+
+        bullActive := false
+
+    else if low <= bullFVGTop and not liveLongOpen and sessionAllowed
+
+        bullTriggered := true
+
+        entryPriceBull = math.min(bullFVGTop, high)
+
+        stopBull = bullSweptLow
+
+        targetBull = float(na)
+
+        if targetMode == "Opposite Liquidity"
+
+            tAbove = f_nearestUntakenAbove(close)
+
+            targetBull := na(tAbove) ? entryPriceBull + (entryPriceBull - stopBull) * targetR : tAbove
+
+        else
+
+            targetBull := entryPriceBull + (entryPriceBull - stopBull) * targetR
+
+        liveLongOpen := true
+
+        liveLongEntry := entryPriceBull
+
+        liveLongStop := stopBull
+
+        liveLongTarget := targetBull
+
+        // Strategy Tester order: same entry SIGNAL bar, exact original SL/TP levels.
+        if strategy.position_size == 0 and not reportOrderIssuedThisBar
+            strategy.entry("AW Long", strategy.long)
+            strategy.exit("AW Long Exit", from_entry="AW Long", stop=stopBull, limit=targetBull)
+            reportOrderIssuedThisBar := true
+
+        if showTrade
+
+            label.new(bar_index, low, "BUY\n" + str.tostring(math.round_to_mintick(entryPriceBull)), style=label.style_label_up, color=bullColor, textcolor=color.white, size=size.small)
+
+            liveLongStopLine := line.new(bar_index, stopBull, bar_index + projectBars, stopBull, color=color.red, style=line.style_dotted)
+
+            liveLongTargetLine := line.new(bar_index, targetBull, bar_index + projectBars, targetBull, color=color.green, style=line.style_dotted)
+
+        isFirstBull = f_dayKey() != lastEntryDayKey
+
+        f_sendEntryWebhook("BUY", stopBull, targetBull, isFirstBull)
+
+        lastEntryDayKey := f_dayKey()
+
+        bullEntrySignal := true
+
+        bullActive := false
+
+// ---------------- Bearish Reversal State Machine ----------------
+
+var bool bearActive = false
+
+var bool bearMSS = false
+
+var bool bearFVGSet = false
+
+var bool bearTriggered = false
+
+var float bearNeckline = na
+
+var int bearNecklineBar = na
+
+var float bearSweptHigh = na
+
+var int bearSweepBar = na
+
+var int bearMSSBar = na
+
+var float bearFVGTop = na
+
+var float bearFVGBot = na
+
+var int bearFVGBar = na
+
+var line bearNecklineLine = na
+
+var box bearFVGBox = na
+
+sweepHighCond = not bearActive and not na(lastPivotHigh) and high > lastPivotHigh and close < lastPivotHigh and bar_index > lastPivotHighBar
+
+if sweepHighCond
+
+    bearActive := true
+
+    bearMSS := false
+
+    bearFVGSet := false
+
+    bearTriggered := false
+
+    bearSweptHigh := high
+
+    bearSweepBar := bar_index
+
+    bearNeckline := lastPivotLow
+
+    bearNecklineBar := lastPivotLowBar
+
+    if showSweeps
+
+        label.new(bar_index, high, "SWEEP", style=label.style_label_down, color=bearColor, textcolor=color.white, size=size.tiny)
+
+    if showNeckline and not na(bearNeckline)
+
+        bearNecklineLine := line.new(bearNecklineBar, bearNeckline, bar_index + maxBarsToMSS, bearNeckline, color=bearColor, style=line.style_dashed)
+
+if bearActive and not bearMSS
+
+    if bar_index - bearSweepBar > maxBarsToMSS
+
+        bearActive := false
+
+    else if not na(bearNeckline) and close < bearNeckline and (open - close) >= atrVal * dispMult and close < open
+
+        bearMSS := true
+
+        bearMSSBar := bar_index
+
+        if showNeckline and not na(bearNecklineLine)
+
+            line.set_x2(bearNecklineLine, bar_index)
+
+        if showSweeps
+
+            label.new(bar_index, low, "SHIFT", style=label.style_label_up, color=bearColor, textcolor=color.white, size=size.tiny)
+
+if bearActive and bearMSS and not bearFVGSet
+
+    if bar_index - bearMSSBar > fvgSearchWindow + 2
+
+        bearActive := false
+
+    else if high < low[2]
+
+        bearFVGSet := true
+
+        bearFVGTop := low[2]
+
+        bearFVGBot := high
+
+        bearFVGBar := bar_index
+
+        if showFVG
+
+            bearFVGBox := box.new(bar_index[2], bearFVGBot, bar_index + maxBarsToEntry, bearFVGTop, border_color=bearColor, bgcolor=color.new(bearColor, 85))
+
+if bearActive and bearFVGSet and not bearTriggered
+
+    if bar_index - bearFVGBar > maxBarsToEntry
+
+        bearActive := false
+
+    else if close > bearSweptHigh
+
+        bearActive := false
+
+    else if high >= bearFVGBot and not liveShortOpen and sessionAllowed
+
+        bearTriggered := true
+
+        entryPriceBear = math.max(bearFVGBot, low)
+
+        stopBear = bearSweptHigh
+
+        targetBear = float(na)
+
+        if targetMode == "Opposite Liquidity"
+
+            tBelow = f_nearestUntakenBelow(close)
+
+            targetBear := na(tBelow) ? entryPriceBear - (stopBear - entryPriceBear) * targetR : tBelow
+
+        else
+
+            targetBear := entryPriceBear - (stopBear - entryPriceBear) * targetR
+
+        liveShortOpen := true
+
+        liveShortEntry := entryPriceBear
+
+        liveShortStop := stopBear
+
+        liveShortTarget := targetBear
+
+        // Strategy Tester order: same entry SIGNAL bar, exact original SL/TP levels.
+        if strategy.position_size == 0 and not reportOrderIssuedThisBar
+            strategy.entry("AW Short", strategy.short)
+            strategy.exit("AW Short Exit", from_entry="AW Short", stop=stopBear, limit=targetBear)
+            reportOrderIssuedThisBar := true
+
+        if showTrade
+
+            label.new(bar_index, high, "SELL\n" + str.tostring(math.round_to_mintick(entryPriceBear)), style=label.style_label_down, color=bearColor, textcolor=color.white, size=size.small)
+
+            liveShortStopLine := line.new(bar_index, stopBear, bar_index + projectBars, stopBear, color=color.red, style=line.style_dotted)
+
+            liveShortTargetLine := line.new(bar_index, targetBear, bar_index + projectBars, targetBear, color=color.green, style=line.style_dotted)
+
+        isFirstBear = f_dayKey() != lastEntryDayKey
+
+        f_sendEntryWebhook("SELL", stopBear, targetBear, isFirstBear)
+
+        lastEntryDayKey := f_dayKey()
+
+        bearEntrySignal := true
+
+        bearActive := false
+
+// ---------------- Plots / Alerts ----------------
+
+plotshape(bullEntrySignal, title="Bull Entry", location=location.belowbar, style=shape.triangleup, color=bullColor, size=size.small)
+
+plotshape(bearEntrySignal, title="Bear Entry", location=location.abovebar, style=shape.triangledown, color=bearColor, size=size.small)
+
+alertcondition(bullEntrySignal, title="AW Model Bullish Entry", message="AW Model: bullish sweep + shift + FVG entry triggered")
+
+alertcondition(bearEntrySignal, title="AW Model Bearish Entry", message="AW Model: bearish sweep + shift + FVG entry triggered")
+
+// ---------------- P&L Table ----------------
+
+tablePosVal = tablePos == "top_right" ? position.top_right : tablePos == "top_left" ? position.top_left : tablePos == "bottom_right" ? position.bottom_right : position.bottom_left
+
+var table pnlTable = table.new(tablePosVal, 4, maxTableRows + 2, border_width=1)
+
+f_fmtDollars(v) =>
+
+    (v >= 0 ? "$" : "-$") + str.tostring(math.round(math.abs(v) * 100) / 100)
+
+// Solid (low-transparency) fills so the table reads clearly regardless of
+
+// chart background - Dark theme for a black/dark chart, Light theme for a
+
+// white/light chart. Text color flips with it so it never washes out.
+
+isDarkTheme = tableTheme == "Dark"
+
+headerBg = isDarkTheme ? color.new(#1b1b1b, 0) : color.new(#d6d6d6, 0)
+
+headerText = isDarkTheme ? color.white : color.black
+
+dateBg = isDarkTheme ? color.new(#2b2b2b, 0) : color.new(#f0f0f0, 0)
+
+neutralText = isDarkTheme ? color.white : color.black
+
+winBg = isDarkTheme ? color.new(#0f4d2e, 0) : color.new(#c8ecd9, 0)
+
+lossBg = isDarkTheme ? color.new(#5c1414, 0) : color.new(#f6cccc, 0)
+
+winText = isDarkTheme ? color.white : color.black
+
+lossText = isDarkTheme ? color.white : color.black
+
+totalBg = isDarkTheme ? color.new(#3a3a3a, 0) : color.new(#c2c2c2, 0)
+
+if showTable and barstate.islast
+
+    table.clear(pnlTable, 0, 0, 3, maxTableRows + 1)
+
+    table.cell(pnlTable, 0, 0, "Date", bgcolor=headerBg, text_color=headerText)
+
+    table.cell(pnlTable, 1, 0, "Daily $", bgcolor=headerBg, text_color=headerText)
+
+    table.cell(pnlTable, 2, 0, "Win Rate", bgcolor=headerBg, text_color=headerText)
+
+    table.cell(pnlTable, 3, 0, "Cum. $", bgcolor=headerBg, text_color=headerText)
+
+    n = array.size(dayOrder)
+
+    startIdx = math.max(0, n - maxTableRows)
+
+    runningCum = 0.0
+
+    // pre-sum any days before the displayed window so the cumulative column stays correct
+
+    if startIdx > 0
+
+        for i = 0 to startIdx - 1
+
+            runningCum := runningCum + map.get(dailyPnl, array.get(dayOrder, i))
+
+    row = 1
+
+    if n > 0
+
+        for i = startIdx to n - 1
+
+            key = array.get(dayOrder, i)
+
+            dayVal = map.get(dailyPnl, key)
+
+            dWins = map.get(dailyWins, key)
+
+            dLosses = map.get(dailyLosses, key)
+
+            dTrades = dWins + dLosses
+
+            dWinRate = dTrades > 0 ? math.round(dWins / dTrades * 100) : 0
+
+            runningCum := runningCum + dayVal
+
+            dayBg = dayVal >= 0 ? winBg : lossBg
+
+            dayTxt = dayVal >= 0 ? winText : lossText
+
+            cumBg = runningCum >= 0 ? winBg : lossBg
+
+            cumTxt = runningCum >= 0 ? winText : lossText
+
+            table.cell(pnlTable, 0, row, key, bgcolor=dateBg, text_color=neutralText)
+
+            table.cell(pnlTable, 1, row, f_fmtDollars(dayVal), bgcolor=dayBg, text_color=dayTxt)
+
+            table.cell(pnlTable, 2, row, str.tostring(dWins) + "-" + str.tostring(dLosses) + " (" + str.tostring(dWinRate) + "%)", bgcolor=dateBg, text_color=neutralText)
+
+            table.cell(pnlTable, 3, row, f_fmtDollars(runningCum), bgcolor=cumBg, text_color=cumTxt)
+
+            row += 1
+
+    cumTotal = array.get(cumTotalArr, 0)
+
+    totalWins = array.get(winLossArr, 0)
+
+    totalLosses = array.get(winLossArr, 1)
+
+    totalTrades = totalWins + totalLosses
+
+    totalWinRate = totalTrades > 0 ? math.round(totalWins / totalTrades * 100) : 0
+
+    totalValBg = cumTotal >= 0 ? winBg : lossBg
+
+    totalValTxt = cumTotal >= 0 ? winText : lossText
+
+    table.cell(pnlTable, 0, row, "TOTAL", bgcolor=totalBg, text_color=neutralText)
+
+    table.cell(pnlTable, 1, row, "", bgcolor=totalBg)
+
+    table.cell(pnlTable, 2, row, str.tostring(totalWins) + "-" + str.tostring(totalLosses) + " (" + str.tostring(totalWinRate) + "%)", bgcolor=totalBg, text_color=neutralText)
+
+    table.cell(pnlTable, 3, row, f_fmtDollars(cumTotal), bgcolor=totalValBg, text_color=totalValTxt)
